@@ -6,6 +6,7 @@ import io
 import wave
 import math
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware  # ADD THIS IMPORT
 from groq import Groq
 import dotenv
 import logging
@@ -16,6 +17,16 @@ logger = logging.getLogger(__name__)
 dotenv.load_dotenv()
 
 app = FastAPI()
+
+# ========== ADD CORS MIDDLEWARE HERE ==========
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins (change to specific domain in production)
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+# ==============================================
 
 groq_api_key = os.getenv("GROQ_API_KEY")
 
@@ -192,19 +203,14 @@ async def websocket_endpoint(websocket: WebSocket):
                     # Send
                     await websocket.send_text(f"Q:{text}")
                     await websocket.send_text(f"A:{answer}")
-                    
-                    last_text = text_lower
-                    logger.info(f"✓ Total: {transcribe_time + gen_time:.1f}s")
+                    last_text = text
                     
                 except Exception as e:
-                    logger.error(f"Error: {e}")
-                    
+                    logger.error(f"Error processing audio: {e}")
+                    await websocket.send_text(f"ERROR:{str(e)}")
+    
     except WebSocketDisconnect:
         logger.info(f"Client {client_id} disconnected")
-    finally:
-        conversations.pop(client_id, None)
-
-if __name__ == "__main__":
-    import uvicorn
-    print("🎯 Accurate Mode: 4s buffers + noise filtering + rate limit handling")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+        if client_id in conversations:
+            del conversations[client_id]
+                   
