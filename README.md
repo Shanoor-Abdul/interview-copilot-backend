@@ -223,7 +223,6 @@ Accuracy	>90%	~85%
 Local Development
 Bash
 
-
 python main.py
 Production (Docker)
 Dockerfile
