@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from groq import Groq
 import dotenv
 import logging
+import base64
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -145,34 +146,33 @@ async def websocket_endpoint(websocket: WebSocket):
     conversations[client_id] = []
     buffer = bytearray()
     last_text = ""
-    last_process_time = 0
     
-    # 2 second buffer
-    BUFFER_SIZE = 64000  # 64000 bytes = 2 seconds of 16kHz 16-bit audio
+    BUFFER_SIZE = 64000  # 2 seconds of audio
     
     try:
         while True:
-            # Receive data
-            message = await websocket.receive()
+            # Receive text message (JSON)
+            message = await websocket.receive_text()
+            logger.info(f"Received text: {message[:100]}...")
             
-            # Debug: log what we received
-            msg_type = type(message).__name__
-            msg_len = len(message) if message else 0
-            logger.info(f"Received: type={msg_type}, len={msg_len}")
-            
-            # Handle text messages
-            if isinstance(message, str):
-                logger.info(f"Text message: '{message}'")
-                if message == "ping":
-                    await websocket.send_text("pong")
+            try:
+                data = json.loads(message)
+            except json.JSONDecodeError:
+                logger.error("Invalid JSON")
                 continue
             
-            # Handle binary data (audio)
-            if isinstance(message, bytes):
-                buffer.extend(message)
-                logger.info(f"Buffer: {len(buffer)}/{BUFFER_SIZE}")
+            # Handle audio message
+            if data.get('type') == 'AUDIO':
+                # Decode base64 to binary
+                try:
+                    audio_bytes = base64.b64decode(data['data'])
+                    buffer.extend(audio_bytes)
+                    logger.info(f"Buffer: {len(buffer)}/{BUFFER_SIZE}")
+                except Exception as e:
+                    logger.error(f"Decode error: {e}")
+                    continue
                 
-                # Process when we have enough data
+                # Process when buffer is full
                 if len(buffer) >= BUFFER_SIZE:
                     process_data = bytes(buffer[:BUFFER_SIZE])
                     buffer = buffer[-8000:]  # Keep 0.5s overlap
@@ -181,27 +181,23 @@ async def websocket_endpoint(websocket: WebSocket):
                     
                     # Check for speech
                     if not has_speech(process_data):
-                        logger.info("Silence detected, skipping")
-                        last_process_time = time.time()
+                        logger.info("Silence detected")
                         continue
                     
+                    # Transcribe
                     try:
                         text = await transcribe_with_retry(process_data)
                         
                         if len(text) < 3:
-                            logger.info(f"Text too short: '{text}'")
                             continue
                         
                         # Filter noise
                         noise_phrases = ["thank", "thanks", "okay", "um", "uh", "hm", "mm"]
                         text_lower = text.lower()
                         if any(p in text_lower for p in noise_phrases) and len(text) < 20:
-                            logger.info(f"Noise skipped: {text}")
                             continue
                         
-                        # Skip duplicates
                         if last_text and text_lower == last_text.lower():
-                            logger.info(f"Duplicate skipped: {text}")
                             continue
                         
                         logger.info(f"✓ Heard: {text}")
@@ -219,16 +215,17 @@ async def websocket_endpoint(websocket: WebSocket):
                         await websocket.send_text(f"Q:{text}")
                         await websocket.send_text(f"A:{answer}")
                         last_text = text
-                        last_process_time = time.time()
                         
                     except Exception as e:
                         logger.error(f"Processing error: {e}")
-                        await websocket.send_text(f"ERROR:{str(e)}")
+            
+            elif data.get('type') == 'ping':
+                await websocket.send_text('pong')
     
     except WebSocketDisconnect:
         logger.info(f"Client {client_id} disconnected")
     except Exception as e:
-        logger.error(f"WebSocket error: {e}")
+        logger.error(f"Error: {e}")
     finally:
         if client_id in conversations:
             del conversations[client_id]
