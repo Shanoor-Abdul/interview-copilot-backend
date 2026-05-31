@@ -68,6 +68,8 @@ def has_speech(audio_data: bytes, threshold=300):
     avg_energy = sum(samples) / len(samples)
     max_energy = max(samples) if samples else 0
     
+    logger.info(f"Audio energy: avg={avg_energy:.0f}, max={max_energy}, samples={len(samples)}")
+    
     return avg_energy > threshold and max_energy > 1000
 
 async def transcribe_with_retry(audio_data: bytes, max_retries=3):
@@ -75,6 +77,7 @@ async def transcribe_with_retry(audio_data: bytes, max_retries=3):
     global last_request_time
     
     wav_data = create_wav_from_pcm(audio_data)
+    logger.info(f"WAV size: {len(wav_data)} bytes")
     
     for attempt in range(max_retries):
         time_since_last = time.time() - last_request_time
@@ -135,7 +138,6 @@ async def generate_answer(question: str, history: list):
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    # SINGLE accept() call at the start
     await websocket.accept()
     client_id = id(websocket)
     logger.info(f"Client {client_id} connected")
@@ -146,20 +148,21 @@ async def websocket_endpoint(websocket: WebSocket):
     last_process_time = 0
     
     # 2 second buffer
-    BUFFER_SIZE = 16000 * 2 * 2  # 64000 bytes
+    BUFFER_SIZE = 64000  # 64000 bytes = 2 seconds of 16kHz 16-bit audio
     
     try:
         while True:
-            # Receive data - handle both text and binary
-            try:
-                message = await websocket.receive()
-            except Exception as e:
-                logger.info(f"Receive ended: {e}")
-                break
+            # Receive data
+            message = await websocket.receive()
+            
+            # Debug: log what we received
+            msg_type = type(message).__name__
+            msg_len = len(message) if message else 0
+            logger.info(f"Received: type={msg_type}, len={msg_len}")
             
             # Handle text messages
             if isinstance(message, str):
-                logger.info(f"Received text: {message}")
+                logger.info(f"Text message: '{message}'")
                 if message == "ping":
                     await websocket.send_text("pong")
                 continue
@@ -178,7 +181,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     
                     # Check for speech
                     if not has_speech(process_data):
-                        logger.info("Silence detected")
+                        logger.info("Silence detected, skipping")
                         last_process_time = time.time()
                         continue
                     
@@ -186,6 +189,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         text = await transcribe_with_retry(process_data)
                         
                         if len(text) < 3:
+                            logger.info(f"Text too short: '{text}'")
                             continue
                         
                         # Filter noise
@@ -197,6 +201,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         
                         # Skip duplicates
                         if last_text and text_lower == last_text.lower():
+                            logger.info(f"Duplicate skipped: {text}")
                             continue
                         
                         logger.info(f"✓ Heard: {text}")
@@ -218,13 +223,13 @@ async def websocket_endpoint(websocket: WebSocket):
                         
                     except Exception as e:
                         logger.error(f"Processing error: {e}")
+                        await websocket.send_text(f"ERROR:{str(e)}")
     
     except WebSocketDisconnect:
         logger.info(f"Client {client_id} disconnected")
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
     finally:
-        # Cleanup
         if client_id in conversations:
             del conversations[client_id]
         logger.info(f"Client {client_id} cleanup complete")
