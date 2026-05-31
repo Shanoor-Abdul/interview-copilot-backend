@@ -35,7 +35,6 @@ groq_client = Groq(api_key=groq_api_key)
 
 SYSTEM_PROMPT = """You are an expert interview assistant. Give concise 3-bullet answers."""
 
-# Better context for software interviews
 TECH_CONTEXT = "Software engineering interview about React, JavaScript, TypeScript, Node.js, Python, system design, algorithms, data structures, coding problems."
 
 conversations = {}
@@ -46,8 +45,8 @@ def create_wav_from_pcm(pcm_data: bytes, sample_rate=16000):
     """Convert raw PCM int16 data to WAV format"""
     wav = io.BytesIO()
     with wave.open(wav, 'wb') as w:
-        w.setnchannels(1)  # Mono
-        w.setsampwidth(2)  # 16-bit
+        w.setnchannels(1)
+        w.setsampwidth(2)
         w.setframerate(sample_rate)
         w.writeframes(pcm_data)
     return wav.getvalue()
@@ -57,7 +56,6 @@ def has_speech(audio_data: bytes, threshold=300):
     if len(audio_data) < 100:
         return False
     
-    # Convert bytes to int16 samples
     samples = []
     for i in range(0, len(audio_data), 2):
         if i+1 < len(audio_data):
@@ -70,8 +68,7 @@ def has_speech(audio_data: bytes, threshold=300):
     avg_energy = sum(samples) / len(samples)
     max_energy = max(samples) if samples else 0
     
-    # Log for debugging
-    logger.info(f"Audio energy: avg={avg_energy:.0f}, max={max_energy}")
+    logger.info(f"Audio energy: avg={avg_energy:.0f}, max={max_energy}, samples={len(samples)}")
     
     return avg_energy > threshold and max_energy > 1000
 
@@ -81,6 +78,7 @@ async def transcribe_with_retry(audio_data: bytes, max_retries=3):
     
     # Convert PCM to WAV
     wav_data = create_wav_from_pcm(audio_data)
+    logger.info(f"WAV size: {len(wav_data)} bytes")
     
     for attempt in range(max_retries):
         time_since_last = time.time() - last_request_time
@@ -96,7 +94,7 @@ async def transcribe_with_retry(audio_data: bytes, max_retries=3):
                 language="en",
                 prompt=TECH_CONTEXT,
                 response_format="text",
-                temperature=0.0,  # More accurate, less creative
+                temperature=0.0,
             )
             
             text = str(result).strip()
@@ -134,7 +132,7 @@ async def generate_answer(question: str, history: list):
     r = groq_client.chat.completions.create(
         messages=messages,
         model="llama-3.1-8b-instant",
-        temperature=0.3,  # Lower for more consistent answers
+        temperature=0.3,
         max_tokens=150,
     )
     return r.choices[0].message.content
@@ -150,25 +148,34 @@ async def websocket_endpoint(websocket: WebSocket):
     last_text = ""
     last_process_time = 0
     
-    # 3 second buffer for faster response (was 4)
-    BUFFER_SIZE = 16000 * 3 * 2  # 3 seconds of 16kHz 16-bit audio
+    # 3 second buffer
+    BUFFER_SIZE = 16000 * 3 * 2
     
     try:
         while True:
-            # Receive binary data directly
-            data = await websocket.receive_bytes()
+            # Receive binary data
+            try:
+                data = await websocket.receive_bytes()
+                logger.debug(f"Received {len(data)} bytes")
+            except Exception as e:
+                logger.error(f"Receive error: {e}")
+                break
+            
             buffer.extend(data)
+            logger.info(f"Buffer size: {len(buffer)}/{BUFFER_SIZE}")
             
             # Process every 3 seconds
             if len(buffer) >= BUFFER_SIZE:
                 if time.time() - last_process_time < 0.5:
-                    buffer = buffer[-16000*2:]  # Keep 1 second overlap
+                    buffer = buffer[-16000*2:]
                     continue
                 
                 process_data = bytes(buffer[:BUFFER_SIZE])
-                buffer = buffer[-8000:]  # Keep 0.5s overlap
+                buffer = buffer[-8000:]
                 
-                # Check for speech with better threshold
+                logger.info(f"Processing {len(process_data)} bytes")
+                
+                # Check for speech
                 if not has_speech(process_data):
                     logger.info("Silence detected, skipping")
                     last_process_time = time.time()
@@ -181,26 +188,26 @@ async def websocket_endpoint(websocket: WebSocket):
                     text = await transcribe_with_retry(process_data)
                     transcribe_time = time.time() - start
                     
-                    if len(text) < 3:  # Skip very short
+                    if len(text) < 3:
+                        logger.info(f"Text too short: '{text}'")
                         continue
                     
-                    # Better noise filtering
+                    # Noise filtering
                     noise_phrases = ["thank", "thanks", "okay", "um", "uh", "hm", "mm", "the end", "end of"]
                     text_lower = text.lower()
                     
-                    # Skip if mostly noise words
                     if any(p in text_lower for p in noise_phrases) and len(text) < 25:
                         logger.info(f"Noise phrase skipped: {text}")
                         continue
                     
-                    # Skip if doesn't look like a question or tech term
+                    # Tech term detection
                     tech_terms = ["what", "how", "why", "explain", "difference", "react", "javascript", 
-                                 "python", "api", "database", "frontend", "backend", "component"]
+                                 "python", "api", "database", "frontend", "backend", "component", "hook", "state"]
                     if not any(t in text_lower for t in tech_terms) and len(text) < 15:
                         logger.info(f"Not a question, skipping: {text}")
                         continue
                     
-                    # Better duplicate detection
+                    # Duplicate detection
                     if last_text:
                         similarity = sum(1 for a, b in zip(text_lower, last_text.lower()) if a == b) / max(len(text), len(last_text))
                         if similarity > 0.7:
@@ -232,9 +239,8 @@ async def websocket_endpoint(websocket: WebSocket):
     
     except WebSocketDisconnect:
         logger.info(f"Client {client_id} disconnected")
-        if client_id in conversations:
-            del conversations[client_id]
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
+    finally:
         if client_id in conversations:
             del conversations[client_id]
