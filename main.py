@@ -148,6 +148,93 @@ async def websocket_endpoint(websocket: WebSocket):
     last_text = ""
     last_process_time = 0
     
+    # 2 second buffer for balance between speed and accuracy
+    BUFFER_SIZE = 16000 * 2 * 2  # 64000 bytes
+    
+    try:
+        while True:
+            # Use receive() to handle both text and binary
+            message = await websocket.receive()
+            
+            # Handle text messages (if any)
+            if isinstance(message, str):
+                logger.info(f"Received text: {message}")
+                if message == "ping":
+                    await websocket.send_text("pong")
+                continue
+            
+            # Handle binary data (audio)
+            if isinstance(message, bytes):
+                buffer.extend(message)
+                logger.info(f"Buffer: {len(buffer)}/{BUFFER_SIZE}")
+                
+                # Process when we have enough data
+                if len(buffer) >= BUFFER_SIZE:
+                    process_data = bytes(buffer[:BUFFER_SIZE])
+                    buffer = buffer[-8000:]  # Keep 0.5s overlap
+                    
+                    logger.info(f"Processing {len(process_data)} bytes")
+                    
+                    # Check for speech
+                    if not has_speech(process_data):
+                        logger.info("Silence detected")
+                        last_process_time = time.time()
+                        continue
+                    
+                    try:
+                        text = await transcribe_with_retry(process_data)
+                        
+                        if len(text) < 3:
+                            continue
+                        
+                        # Filter noise
+                        noise_phrases = ["thank", "thanks", "okay", "um", "uh", "hm", "mm"]
+                        text_lower = text.lower()
+                        if any(p in text_lower for p in noise_phrases) and len(text) < 20:
+                            logger.info(f"Noise skipped: {text}")
+                            continue
+                        
+                        # Skip duplicates
+                        if last_text and text_lower == last_text.lower():
+                            continue
+                        
+                        logger.info(f"✓ Heard: {text}")
+                        
+                        # Generate answer
+                        answer = await generate_answer(text, conversations[client_id])
+                        
+                        # Store and send
+                        conversations[client_id].append({
+                            "question": text,
+                            "answer": answer,
+                            "time": time.time()
+                        })
+                        
+                        await websocket.send_text(f"Q:{text}")
+                        await websocket.send_text(f"A:{answer}")
+                        last_text = text
+                        last_process_time = time.time()
+                        
+                    except Exception as e:
+                        logger.error(f"Processing error: {e}")
+                        await websocket.send_text(f"ERROR:{str(e)}")
+    
+    except WebSocketDisconnect:
+        logger.info(f"Client {client_id} disconnected")
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+    finally:
+        if client_id in conversations:
+            del conversations[client_id]
+    await websocket.accept()
+    client_id = id(websocket)
+    logger.info(f"Client {client_id} connected")
+    
+    conversations[client_id] = []
+    buffer = bytearray()
+    last_text = ""
+    last_process_time = 0
+    
     # Process every 1 second
     BUFFER_SIZE = 32000  # 1 second of 16kHz 16-bit audio
     
@@ -156,7 +243,7 @@ async def websocket_endpoint(websocket: WebSocket):
             # Receive with timeout to prevent hanging
             try:
                 data = await asyncio.wait_for(
-                    websocket.receive_bytes(), 
+                    websocket.receive(), 
                     timeout=5.0  # 5 second timeout
                 )
                 buffer.extend(data)
