@@ -148,99 +148,80 @@ async def websocket_endpoint(websocket: WebSocket):
     last_text = ""
     last_process_time = 0
     
-    # 3 second buffer
-    BUFFER_SIZE = 16000 * 3 * 2
+    # Process every 1 second
+    BUFFER_SIZE = 32000  # 1 second of 16kHz 16-bit audio
     
     try:
         while True:
-            # Receive binary data
+            # Receive with timeout to prevent hanging
             try:
-                data = await websocket.receive_bytes()
-                logger.debug(f"Received {len(data)} bytes")
-            except Exception as e:
-                logger.error(f"Receive error: {e}")
-                break
+                data = await asyncio.wait_for(
+                    websocket.receive_bytes(), 
+                    timeout=5.0  # 5 second timeout
+                )
+                buffer.extend(data)
+                logger.info(f"Buffer: {len(buffer)}/{BUFFER_SIZE}")
+            except asyncio.TimeoutError:
+                logger.warning("Receive timeout, checking buffer...")
+                # Process partial buffer if we have enough
+                if len(buffer) >= BUFFER_SIZE // 2:  # Process if we have 0.5s
+                    pass  # Fall through to processing
+                else:
+                    continue  # Keep waiting
             
-            buffer.extend(data)
-            logger.info(f"Buffer size: {len(buffer)}/{BUFFER_SIZE}")
-            
-            # Process every 3 seconds
+            # Process when we have enough data
             if len(buffer) >= BUFFER_SIZE:
-                if time.time() - last_process_time < 0.5:
-                    buffer = buffer[-16000*2:]
-                    continue
-                
                 process_data = bytes(buffer[:BUFFER_SIZE])
-                buffer = buffer[-8000:]
+                buffer = buffer[-4000:]  # Keep 0.25s overlap
                 
                 logger.info(f"Processing {len(process_data)} bytes")
                 
                 # Check for speech
                 if not has_speech(process_data):
-                    logger.info("Silence detected, skipping")
+                    logger.info("Silence detected")
                     last_process_time = time.time()
                     continue
                 
                 try:
-                    last_process_time = time.time()
-                    start = time.time()
-                    
                     text = await transcribe_with_retry(process_data)
-                    transcribe_time = time.time() - start
                     
                     if len(text) < 3:
-                        logger.info(f"Text too short: '{text}'")
                         continue
                     
-                    # Noise filtering
-                    noise_phrases = ["thank", "thanks", "okay", "um", "uh", "hm", "mm", "the end", "end of"]
+                    # Filter noise
+                    noise_phrases = ["thank", "thanks", "okay", "um", "uh", "hm", "mm"]
                     text_lower = text.lower()
-                    
-                    if any(p in text_lower for p in noise_phrases) and len(text) < 25:
-                        logger.info(f"Noise phrase skipped: {text}")
+                    if any(p in text_lower for p in noise_phrases) and len(text) < 20:
                         continue
                     
-                    # Tech term detection
-                    tech_terms = ["what", "how", "why", "explain", "difference", "react", "javascript", 
-                                 "python", "api", "database", "frontend", "backend", "component", "hook", "state"]
-                    if not any(t in text_lower for t in tech_terms) and len(text) < 15:
-                        logger.info(f"Not a question, skipping: {text}")
+                    # Skip duplicates
+                    if last_text and text_lower == last_text.lower():
                         continue
                     
-                    # Duplicate detection
-                    if last_text:
-                        similarity = sum(1 for a, b in zip(text_lower, last_text.lower()) if a == b) / max(len(text), len(last_text))
-                        if similarity > 0.7:
-                            logger.info(f"Similar to last ({similarity:.2f}), skipping")
-                            continue
-                    
-                    logger.info(f"✓ Heard ({transcribe_time:.1f}s): {text}")
+                    logger.info(f"✓ Heard: {text}")
                     
                     # Generate answer
-                    start = time.time()
                     answer = await generate_answer(text, conversations[client_id])
-                    gen_time = time.time() - start
                     
-                    # Store
+                    # Store and send
                     conversations[client_id].append({
                         "question": text,
                         "answer": answer,
                         "time": time.time()
                     })
                     
-                    # Send
                     await websocket.send_text(f"Q:{text}")
                     await websocket.send_text(f"A:{answer}")
                     last_text = text
+                    last_process_time = time.time()
                     
                 except Exception as e:
-                    logger.error(f"Error processing audio: {e}")
-                    await websocket.send_text(f"ERROR:{str(e)}")
+                    logger.error(f"Processing error: {e}")
     
     except WebSocketDisconnect:
         logger.info(f"Client {client_id} disconnected")
     except Exception as e:
-        logger.error(f"WebSocket error: {e}")
+        logger.error(f"Error: {e}")
     finally:
         if client_id in conversations:
             del conversations[client_id]
