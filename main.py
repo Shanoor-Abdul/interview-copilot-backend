@@ -6,7 +6,7 @@ import io
 import wave
 import math
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware  # ADD THIS IMPORT
+from fastapi.middleware.cors import CORSMiddleware
 from groq import Groq
 import dotenv
 import logging
@@ -18,15 +18,13 @@ dotenv.load_dotenv()
 
 app = FastAPI()
 
-# ========== ADD CORS MIDDLEWARE HERE ==========
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins (change to specific domain in production)
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-# ==============================================
 
 groq_api_key = os.getenv("GROQ_API_KEY")
 
@@ -37,63 +35,78 @@ groq_client = Groq(api_key=groq_api_key)
 
 SYSTEM_PROMPT = """You are an expert interview assistant. Give concise 3-bullet answers."""
 
-# Technical context for better recognition
-TECH_CONTEXT = "Software engineering interview: React, JavaScript, hooks, useState, useEffect, components, props, state, API, frontend, backend, Node.js."
+# Better context for software interviews
+TECH_CONTEXT = "Software engineering interview about React, JavaScript, TypeScript, Node.js, Python, system design, algorithms, data structures, coding problems."
 
 conversations = {}
 last_request_time = 0
-MIN_REQUEST_INTERVAL = 1.5  # Seconds between API calls to avoid rate limits
+MIN_REQUEST_INTERVAL = 1.5
 
-def create_wav(audio_data: bytes):
+def create_wav_from_pcm(pcm_data: bytes, sample_rate=16000):
+    """Convert raw PCM int16 data to WAV format"""
     wav = io.BytesIO()
     with wave.open(wav, 'wb') as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(16000)
-        w.writeframes(audio_data)
+        w.setnchannels(1)  # Mono
+        w.setsampwidth(2)  # 16-bit
+        w.setframerate(sample_rate)
+        w.writeframes(pcm_data)
     return wav.getvalue()
 
-def has_speech(audio_data: bytes, threshold=500):
-    """Check if audio contains actual speech (not silence)"""
+def has_speech(audio_data: bytes, threshold=300):
+    """Check if audio contains actual speech"""
     if len(audio_data) < 100:
         return False
-    # Simple energy check
+    
+    # Convert bytes to int16 samples
     samples = []
     for i in range(0, len(audio_data), 2):
         if i+1 < len(audio_data):
             sample = int.from_bytes(audio_data[i:i+2], 'little', signed=True)
             samples.append(abs(sample))
+    
     if not samples:
         return False
+    
     avg_energy = sum(samples) / len(samples)
-    return avg_energy > threshold
+    max_energy = max(samples) if samples else 0
+    
+    # Log for debugging
+    logger.info(f"Audio energy: avg={avg_energy:.0f}, max={max_energy}")
+    
+    return avg_energy > threshold and max_energy > 1000
 
 async def transcribe_with_retry(audio_data: bytes, max_retries=3):
-    """Transcribe with rate limit handling"""
+    """Transcribe with better error handling"""
     global last_request_time
     
-    wav = create_wav(audio_data)
+    # Convert PCM to WAV
+    wav_data = create_wav_from_pcm(audio_data)
     
     for attempt in range(max_retries):
-        # Rate limit delay
         time_since_last = time.time() - last_request_time
         if time_since_last < MIN_REQUEST_INTERVAL:
             await asyncio.sleep(MIN_REQUEST_INTERVAL - time_since_last)
         
         try:
             last_request_time = time.time()
+            
             result = groq_client.audio.transcriptions.create(
-                file=("audio.wav", wav, "audio/wav"),
+                file=("audio.wav", wav_data, "audio/wav"),
                 model="whisper-large-v3-turbo",
                 language="en",
                 prompt=TECH_CONTEXT,
-                response_format="text"
+                response_format="text",
+                temperature=0.0,  # More accurate, less creative
             )
-            return str(result).strip()
+            
+            text = str(result).strip()
+            logger.info(f"Transcription: '{text}'")
+            return text
             
         except Exception as e:
+            logger.error(f"Transcription error (attempt {attempt+1}): {e}")
             if "429" in str(e) or "rate limit" in str(e).lower():
-                wait_time = 2 ** attempt  # Exponential backoff: 1, 2, 4 seconds
+                wait_time = 2 ** attempt
                 logger.warning(f"Rate limited, waiting {wait_time}s...")
                 await asyncio.sleep(wait_time)
             else:
@@ -102,16 +115,15 @@ async def transcribe_with_retry(audio_data: bytes, max_retries=3):
     return ""
 
 async def generate_answer(question: str, history: list):
-    """Generate answer"""
+    """Generate answer with better prompt"""
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     
     for h in history[-2:]:
         messages.append({"role": "user", "content": h['question']})
         messages.append({"role": "assistant", "content": h['answer']})
     
-    messages.append({"role": "user", "content": question})
+    messages.append({"role": "user", "content": f"Interview question: {question}"})
     
-    # Rate limit
     global last_request_time
     time_since_last = time.time() - last_request_time
     if time_since_last < 0.5:
@@ -122,8 +134,8 @@ async def generate_answer(question: str, history: list):
     r = groq_client.chat.completions.create(
         messages=messages,
         model="llama-3.1-8b-instant",
-        temperature=0.5,
-        max_tokens=80,
+        temperature=0.3,  # Lower for more consistent answers
+        max_tokens=150,
     )
     return r.choices[0].message.content
 
@@ -138,26 +150,25 @@ async def websocket_endpoint(websocket: WebSocket):
     last_text = ""
     last_process_time = 0
     
-    # 4 second buffer for better accuracy
-    BUFFER_SIZE = 16000 * 4 * 2
+    # 3 second buffer for faster response (was 4)
+    BUFFER_SIZE = 16000 * 3 * 2  # 3 seconds of 16kHz 16-bit audio
     
     try:
         while True:
+            # Receive binary data directly
             data = await websocket.receive_bytes()
             buffer.extend(data)
             
-            # Process every 4 seconds
+            # Process every 3 seconds
             if len(buffer) >= BUFFER_SIZE:
-                # Check if enough time passed (rate limiting)
-                if time.time() - last_process_time < 1.0:
-                    # Keep only last 1 second for overlap
-                    buffer = buffer[-16000*2:]
+                if time.time() - last_process_time < 0.5:
+                    buffer = buffer[-16000*2:]  # Keep 1 second overlap
                     continue
                 
                 process_data = bytes(buffer[:BUFFER_SIZE])
-                buffer = buffer[-16000:]  # Keep 0.5s overlap
+                buffer = buffer[-8000:]  # Keep 0.5s overlap
                 
-                # Check for speech (skip silence)
+                # Check for speech with better threshold
                 if not has_speech(process_data):
                     logger.info("Silence detected, skipping")
                     last_process_time = time.time()
@@ -166,23 +177,33 @@ async def websocket_endpoint(websocket: WebSocket):
                 try:
                     last_process_time = time.time()
                     start = time.time()
+                    
                     text = await transcribe_with_retry(process_data)
                     transcribe_time = time.time() - start
                     
-                    if len(text) < 5:  # Skip very short
+                    if len(text) < 3:  # Skip very short
                         continue
                     
-                    # Skip common noise phrases
-                    noise_phrases = ["thank you", "thanks", "okay", "um", "uh", "hm", "mm"]
-                    if any(p in text.lower() and len(text) < 20 for p in noise_phrases):
+                    # Better noise filtering
+                    noise_phrases = ["thank", "thanks", "okay", "um", "uh", "hm", "mm", "the end", "end of"]
+                    text_lower = text.lower()
+                    
+                    # Skip if mostly noise words
+                    if any(p in text_lower for p in noise_phrases) and len(text) < 25:
                         logger.info(f"Noise phrase skipped: {text}")
                         continue
                     
-                    # Better duplicate detection (fuzzy match)
-                    text_lower = text.lower()
-                    if last_text and (text_lower in last_text or last_text in text_lower):
-                        similarity = len(set(text_lower.split()) & set(last_text.split())) / max(len(text_lower.split()), 1)
-                        if similarity > 0.6:
+                    # Skip if doesn't look like a question or tech term
+                    tech_terms = ["what", "how", "why", "explain", "difference", "react", "javascript", 
+                                 "python", "api", "database", "frontend", "backend", "component"]
+                    if not any(t in text_lower for t in tech_terms) and len(text) < 15:
+                        logger.info(f"Not a question, skipping: {text}")
+                        continue
+                    
+                    # Better duplicate detection
+                    if last_text:
+                        similarity = sum(1 for a, b in zip(text_lower, last_text.lower()) if a == b) / max(len(text), len(last_text))
+                        if similarity > 0.7:
                             logger.info(f"Similar to last ({similarity:.2f}), skipping")
                             continue
                     
@@ -213,4 +234,7 @@ async def websocket_endpoint(websocket: WebSocket):
         logger.info(f"Client {client_id} disconnected")
         if client_id in conversations:
             del conversations[client_id]
-                   
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+        if client_id in conversations:
+            del conversations[client_id]
